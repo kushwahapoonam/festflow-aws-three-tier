@@ -1,3 +1,4 @@
+
 # FestFlow
 
 FestFlow is a serverless demo for a Bengaluru film and food festival. A customer picks a screening, reserves seats and an optional food pickup slot, simulates payment, and receives a QR ticket. Venue staff can check in a ticket, kitchen staff can manage pickup orders, and administrators can assign operator scopes and view audit history.
@@ -143,3 +144,4 @@ Run `npm run check`, `npm test` with DynamoDB Local running, and `npm run build`
 | [`manual/`](manual/START-HERE.md) | Console settings, seed data, IAM policies and upload files |
 | [`scripts/`](scripts/) | Local setup, change sets, catalogue seed, web publishing and teardown |
 | [`docs/`](docs/) | Architecture, workflows, operations, and verification |
+
