@@ -1,0 +1,37 @@
+{
+  "pk": {
+    "S": "FESTIVAL"
+  },
+  "sk": {
+    "S": "KITCHEN#tiffin"
+  },
+  "id": {
+    "S": "tiffin"
+  },
+  "name": {
+    "S": "The Tiffin Window"
+  },
+  "venue": {
+    "S": "silk"
+  },
+  "menu": {
+    "L": [
+      {
+        "M": {
+          "id": {
+            "S": "puff"
+          },
+          "name": {
+            "S": "Pepper mushroom puff"
+          },
+          "price": {
+            "N": "140"
+          },
+          "detail": {
+            "S": "Flaky pastry and cracked pepper"
+          }
+        }
+      }
+    ]
+  }
+}

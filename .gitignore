@@ -1,0 +1,8 @@
+node_modules/
+.aws-sam/
+.festflow/
+web/dist/
+.env*
+dynamodb-local-metadata.json
+
+/node_modules

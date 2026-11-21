@@ -1,0 +1,38 @@
+{
+  "pk": {
+    "S": "FESTIVAL"
+  },
+  "sk": {
+    "S": "SHOW#last-call"
+  },
+  "id": {
+    "S": "last-call"
+  },
+  "venue": {
+    "S": "silk"
+  },
+  "venueName": {
+    "S": "Silk Mill Studio"
+  },
+  "title": {
+    "S": "Last Call"
+  },
+  "note": {
+    "S": "A Bengaluru film festival screening."
+  },
+  "genre": {
+    "S": "Comedy shorts"
+  },
+  "startsAt": {
+    "S": "2026-12-31T16:30:00.000Z"
+  },
+  "open": {
+    "BOOL": true
+  },
+  "price": {
+    "N": "250"
+  },
+  "art": {
+    "S": "moon"
+  }
+}

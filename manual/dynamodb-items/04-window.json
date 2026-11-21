@@ -1,0 +1,20 @@
+{
+  "pk": {
+    "S": "KITCHEN#tiffin"
+  },
+  "sk": {
+    "S": "SLOT#window-3"
+  },
+  "id": {
+    "S": "window-3"
+  },
+  "at": {
+    "S": "2026-12-31T16:00:00.000Z"
+  },
+  "used": {
+    "N": "0"
+  },
+  "capacity": {
+    "N": "1"
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "loginUrl": "https://YOUR-PREFIX.auth.us-east-1.amazoncognito.com",
+  "clientId": "YOUR_COGNITO_APP_CLIENT_ID"
+}

@@ -1,0 +1,128 @@
+name: FestFlow
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      configure_login:
+        description: Register the existing stack CloudFront host as a Cognito callback
+        type: boolean
+        default: false
+      deployment:
+        description: Review and apply to the demo environment
+        type: boolean
+        default: false
+permissions:
+  contents: read
+env:
+  AWS_REGION: us-east-1
+  STACK: festflow-demo
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: npm ci
+      - run: npm run check
+      - name: Verify transaction behavior
+        run: |
+          bash scripts/ddb-local.sh > /tmp/ddb.log 2>&1 &
+          ddb_pid=$!
+          trap 'kill "$ddb_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:8000; then break; fi
+            sleep 1
+          done
+          npm test
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          if-no-files-found: error
+  plan:
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: festflow-plan
+    concurrency:
+      group: festflow-plan
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      changeset: ${{ steps.plan.outputs.changeset }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: npm ci
+      - name: Build and create a reviewable change set
+        id: plan
+        env:
+          ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+          LOGIN_PREFIX: ${{ vars.LOGIN_PREFIX }}
+          CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+          CONFIGURE_LOGIN: ${{ inputs.configure_login }}
+        run: |
+          if [[ "$CONFIGURE_LOGIN" == true ]]; then
+            export EDGE_HOST="$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='EdgeHost'].OutputValue | [0]" --output text)"
+          fi
+          bash scripts/plan.sh
+          echo "changeset=$(cat .festflow/change-set.arn)" >> "$GITHUB_OUTPUT"
+          {
+            echo '### FestFlow change set'
+            echo
+            jq -r '.StatusReason // .ChangeSetId' .festflow/change-set.json
+            echo
+            jq -r '.Changes[]?.ResourceChange | "- " + .Action + " " + .LogicalResourceId + " (" + (.Replacement // "N/A") + ")"' .festflow/change-set.json
+          } >> "$GITHUB_STEP_SUMMARY"
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deployment
+    needs: [verify, plan]
+    runs-on: ubuntu-latest
+    environment: festflow
+    concurrency:
+      group: festflow-deploy
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+      - run: npm ci
+      - name: Apply reviewed resources and publish UI
+        env:
+          CHANGE_SET: ${{ needs.plan.outputs.changeset }}
+        run: |
+          if [[ -n "$CHANGE_SET" ]]; then bash scripts/apply.sh "$CHANGE_SET"; fi
+          source scripts/common.sh
+          stack_outputs="$(outputs)"
+          TABLE_NAME="$(out TableName)" npm run seed
+          bash scripts/publish.sh "$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bash scripts/smoke.sh "$(out PublicUrl)"

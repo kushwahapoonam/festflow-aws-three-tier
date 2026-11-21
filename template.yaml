@@ -1,0 +1,602 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: FestFlow regional serverless festival booking and operations lab
+
+Parameters:
+  LoginPrefix:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9-]{2,40}[a-z0-9]'
+    Description: Globally unique managed-login prefix for this region
+  EdgeHostname:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$)|(^[a-z0-9]+[.]cloudfront[.]net$)'
+    Description: Populate with EdgeHost output in the second change set
+  CustomDomain:
+    Type: String
+    Default: ''
+  ViewerCertificateArn:
+    Type: String
+    Default: 'arn:aws:acm:us-east-1:000000000000:certificate/unconfigured'
+    AllowedPattern: 'arn:aws:acm:us-east-1:[0-9]{12}:certificate/.+'
+  PublicHostedZoneId:
+    Type: String
+    Default: ''
+  HoldSeconds:
+    Type: Number
+    Default: 120
+    MinValue: 30
+    MaxValue: 600
+  ReconcileEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true','false']
+  EnableAlarms:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+  FailTicketId:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$)|(^[a-f0-9]{32}$)'
+    Description: Optional targeted failure drill
+
+Rules:
+  VanityRequiresInputs:
+    RuleCondition: !Not [!Equals [!Ref CustomDomain, '']]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref EdgeHostname, '']]
+          - !Not [!Equals [!Ref ViewerCertificateArn, 'arn:aws:acm:us-east-1:000000000000:certificate/unconfigured']]
+          - !Not [!Equals [!Ref PublicHostedZoneId, '']]
+        AssertDescription: Supply the edge hostname, certificate ARN and hosted zone ID for a vanity hostname.
+Conditions:
+  HasEdge: !Not [!Equals [!Ref EdgeHostname, '']]
+  HasVanity: !Not [!Equals [!Ref CustomDomain, '']]
+  HasAlarms: !Equals [!Ref EnableAlarms, 'true']
+  RunReconcile: !Equals [!Ref ReconcileEnabled, 'true']
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [x86_64]
+    MemorySize: 256
+    Timeout: 15
+    Tags: {Project: FestFlow}
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref Data
+
+Resources:
+  Data:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: gpk, AttributeType: S}
+        - {AttributeName: gsk, AttributeType: S}
+        - {AttributeName: vpk, AttributeType: S}
+        - {AttributeName: vsk, AttributeType: S}
+        - {AttributeName: kpk, AttributeType: S}
+        - {AttributeName: ksk, AttributeType: S}
+      GlobalSecondaryIndexes:
+        - IndexName: Lookup
+          KeySchema:
+            - {AttributeName: gpk, KeyType: HASH}
+            - {AttributeName: gsk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: Venue
+          KeySchema:
+            - {AttributeName: vpk, KeyType: HASH}
+            - {AttributeName: vsk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: Kitchen
+          KeySchema:
+            - {AttributeName: kpk, KeyType: HASH}
+            - {AttributeName: ksk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      Tags:
+        - {Key: Project, Value: FestFlow}
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolTier: LITE
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      UsernameAttributes: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - {Name: verified_email, Priority: 1}
+      UsernameConfiguration: {CaseSensitive: false}
+      UserPoolTags: {Project: FestFlow}
+  LoginDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref LoginPrefix
+      UserPoolId: !Ref UserPool
+      ManagedLoginVersion: 1
+  WebClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid]
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 1
+      TokenValidityUnits: {AccessToken: hours, IdToken: hours, RefreshToken: days}
+      CallbackURLs:
+        - !If [HasEdge, !Sub 'https://${EdgeHostname}/', 'http://localhost:5173/']
+        - !If [HasVanity, !Sub 'https://${CustomDomain}/', !Ref 'AWS::NoValue']
+      LogoutURLs:
+        - !If [HasEdge, !Sub 'https://${EdgeHostname}/', 'http://localhost:5173/']
+        - !If [HasVanity, !Sub 'https://${CustomDomain}/', !Ref 'AWS::NoValue']
+  VenueGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: venue, UserPoolId: !Ref UserPool}
+  KitchenGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: kitchen, UserPoolId: !Ref UserPool}
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: admin, UserPoolId: !Ref UserPool}
+
+  GatewayLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}', RetentionInDays: 3}
+  Gateway:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      DefaultRouteSettings: {ThrottlingBurstLimit: 40, ThrottlingRateLimit: 20}
+      AccessLogSettings:
+        DestinationArn: !GetAtt GatewayLogs.Arn
+        Format: '{"requestId":"$context.requestId","route":"$context.routeKey","method":"$context.httpMethod","status":"$context.status","responseLength":"$context.responseLength","integrationStatus":"$context.integration.status"}'
+      Auth:
+        DefaultAuthorizer: UserJwt
+        Authorizers:
+          UserJwt:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+              audience: [!Ref WebClient]
+            AuthorizationScopes: [openid]
+      Tags: {Project: FestFlow}
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      Tags: [{Key: Project, Value: FestFlow}]
+  TicketBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      Tags: [{Key: Project, Value: FestFlow}]
+  TicketBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TicketBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt TicketBucket.Arn, !Sub '${TicketBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  OriginAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SpaRewrite:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-spa'
+      AutoPublish: true
+      FunctionConfig: {Comment: Rewrite extensionless browser routes, Runtime: cloudfront-js-2.0}
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          if (request.uri !== '/api' && request.uri.indexOf('/api/') !== 0 &&
+              !request.uri.substring(request.uri.lastIndexOf('/') + 1).includes('.')) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+  Edge:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags: [{Key: Project, Value: FestFlow}]
+      DistributionConfig:
+        Comment: FestFlow private frontend and uncached API
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        Aliases: !If [HasVanity, [!Ref CustomDomain], !Ref 'AWS::NoValue']
+        ViewerCertificate: !If
+          - HasVanity
+          - {AcmCertificateArn: !Ref ViewerCertificateArn, SslSupportMethod: sni-only, MinimumProtocolVersion: TLSv1.2_2021}
+          - {CloudFrontDefaultCertificate: true}
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccess
+            S3OriginConfig: {OriginAccessIdentity: ''}
+          - Id: api
+            DomainName: !Sub '${Gateway}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+            CustomOriginConfig: {OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2]}
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref WebCache
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRewrite.FunctionARN
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+            OriginRequestPolicyId: 'b689b0a8-53d0-40ab-baf2-68738e2966ac'
+  WebCache:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-web'
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig: {HeaderBehavior: none}
+          CookiesConfig: {CookieBehavior: none}
+          QueryStringsConfig: {QueryStringBehavior: none}
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${WebBucket.Arn}/*'
+            Condition: {StringEquals: {'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Edge}'}}
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt WebBucket.Arn, !Sub '${WebBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  DomainRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasVanity
+    Properties:
+      HostedZoneId: !Ref PublicHostedZoneId
+      RecordSets:
+        - Name: !Ref CustomDomain
+          Type: A
+          AliasTarget: {DNSName: !GetAtt Edge.DomainName, HostedZoneId: Z2FDTNDATAQYW2, EvaluateTargetHealth: false}
+        - Name: !Ref CustomDomain
+          Type: AAAA
+          AliasTarget: {DNSName: !GetAtt Edge.DomainName, HostedZoneId: Z2FDTNDATAQYW2, EvaluateTargetHealth: false}
+  TicketDLQ:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  TicketQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 120
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt TicketDLQ.Arn, maxReceiveCount: 3}
+
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api', RetentionInDays: 3}
+  ReconcileLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-reconcile', RetentionInDays: 3}
+  TicketLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ticket', RetentionInDays: 3}
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Tags: [{Key: Project, Value: FestFlow}]
+      Policies:
+        - PolicyName: FestFlowRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ApiLogs.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:PutItem, dynamodb:ConditionCheckItem]
+                Resource: !GetAtt Data.Arn
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: [!GetAtt Data.Arn, !Sub '${Data.Arn}/index/*']
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${TicketBucket.Arn}/tickets/*'
+
+  ReconcileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Tags: [{Key: Project, Value: FestFlow}]
+      Policies:
+        - PolicyName: FestFlowRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ReconcileLogs.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:PutItem]
+                Resource: !GetAtt Data.Arn
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub '${Data.Arn}/index/Lookup'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt TicketQueue.Arn
+
+  TicketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Tags: [{Key: Project, Value: FestFlow}]
+      Policies:
+        - PolicyName: FestFlowRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt TicketLogs.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt TicketQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:PutItem]
+                Resource: !GetAtt Data.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${TicketBucket.Arn}/tickets/*'
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiLogs
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: {EntryPoints: [src/api.ts], Target: es2022, Minify: true}
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      CodeUri: .
+      Handler: api.handler
+      Environment:
+        Variables:
+          TICKET_BUCKET: !Ref TicketBucket
+          HOLD_SECONDS: !Ref HoldSeconds
+      Role: !GetAtt ApiRole.Arn
+      Events:
+        Events:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/events'
+            Method: GET
+            Auth: {Authorizer: NONE}
+        Availability:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/shows/{id}/availability'
+            Method: GET
+            Auth: {Authorizer: NONE}
+        Me:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/me'
+            Method: GET
+        Hold:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/holds'
+            Method: POST
+        History:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/bookings'
+            Method: GET
+        Booking:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/bookings/{id}'
+            Method: GET
+        Payment:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/bookings/{id}/payment'
+            Method: POST
+        Cancel:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/bookings/{id}/cancel'
+            Method: POST
+        Ticket:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/bookings/{id}/ticket'
+            Method: GET
+        VenueBookings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/venue/{id}/bookings'
+            Method: GET
+        VenueShow:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/venue/{id}/shows/{show}'
+            Method: PATCH
+        VenueSeat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/venue/{id}/shows/{show}/seats/{seat}'
+            Method: PATCH
+        CheckIn:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/venue/{id}/check-in'
+            Method: POST
+        KitchenOrders:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/kitchen/{id}/orders'
+            Method: GET
+        KitchenUpdate:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/kitchen/{id}/orders/{order}'
+            Method: PATCH
+        Audit:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/admin/audit'
+            Method: GET
+        Assignment:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Gateway
+            Path: '/api/admin/operators/{sub}'
+            Method: PUT
+  ReconcileFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ReconcileLogs
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: {EntryPoints: [src/tickets.ts], Target: es2022, Minify: true}
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-reconcile'
+      CodeUri: .
+      Handler: tickets.scheduled
+      Timeout: 30
+      Environment:
+        Variables:
+          TICKET_QUEUE: !Ref TicketQueue
+      Role: !GetAtt ReconcileRole.Arn
+      Events:
+        Clock:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Name: !Sub '${AWS::StackName}-reconcile'
+            Enabled: !If [RunReconcile, true, false]
+  TicketFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: TicketLogs
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: {EntryPoints: [src/tickets.ts], Target: es2022, Minify: true}
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ticket'
+      CodeUri: .
+      Handler: tickets.consume
+      Environment:
+        Variables:
+          TICKET_BUCKET: !Ref TicketBucket
+          FAIL_TICKET_ID: !Ref FailTicketId
+      Role: !GetAtt TicketRole.Arn
+      Events:
+        Jobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TicketQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 2}
+  DeadLetters:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarms
+    Properties:
+      AlarmDescription: FestFlow ticket jobs requiring review
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt TicketDLQ.QueueName}]
+      Period: 60
+      EvaluationPeriods: 1
+      Statistic: Maximum
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  EdgeHost: {Value: !GetAtt Edge.DomainName}
+  EdgeId: {Value: !Ref Edge}
+  PublicUrl: {Value: !Sub 'https://${Edge.DomainName}'}
+  WebBucket: {Value: !Ref WebBucket}
+  TicketBucket: {Value: !Ref TicketBucket}
+  TableName: {Value: !Ref Data}
+  UserPoolId: {Value: !Ref UserPool}
+  WebClientId: {Value: !Ref WebClient}
+  LoginUrl: {Value: !Sub 'https://${LoginPrefix}.auth.${AWS::Region}.amazoncognito.com'}
+  ApiEndpoint: {Value: !GetAtt Gateway.ApiEndpoint}
+  ReconcileName: {Value: !Ref ReconcileFunction}
+  TicketQueueArn: {Value: !GetAtt TicketQueue.Arn}
+  TicketDLQArn: {Value: !GetAtt TicketDLQ.Arn}
